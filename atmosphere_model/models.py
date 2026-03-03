@@ -9,7 +9,10 @@ from scipy import interpolate
 import yaml
 from copy import deepcopy
 
-from fixedpoint import RobustFixedPointSolver
+try:
+    from .fixedpoint import RobustFixedPointSolver
+except ImportError:
+    from fixedpoint import RobustFixedPointSolver
 
 from photochem import EvoAtmosphere, PhotoException
 from photochem.clima import AdiabatClimate, ClimaException

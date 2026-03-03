@@ -1,10 +1,13 @@
 from photochem.utils import settings_file_for_climate, species_file_for_climate, stars
 from photochem.utils._format import yaml, FormatSettings_main, MyDumper
 from photochem.utils import zahnle_rx_and_thermo_files
-import planets
 from astropy import constants
 import os
 THISFILE = os.path.dirname(os.path.abspath(__file__))
+try:
+    from . import planets
+except ImportError:
+    import planets
 
 def main():
 
