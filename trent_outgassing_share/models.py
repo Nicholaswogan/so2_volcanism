@@ -7,6 +7,7 @@ from scipy import integrate
 from scipy import constants as const
 from scipy import interpolate
 import yaml
+from copy import deepcopy
 
 from fixedpoint import RobustFixedPointSolver
 
@@ -17,32 +18,26 @@ from photochem.equilibrate import ChemEquiAnalysis
 ### Modified version of Climate model ###
 
 class AdiabatClimateEquilibrium(AdiabatClimate):
-    """Couples surface thermochemical equilibrium with a 1-D climate solve.
-
-    The class wraps :class:`photochem.clima.AdiabatClimate` and adds a
-    fixed-point closure in which:
-
-    1. Surface composition is computed from thermochemical equilibrium at the
-       current surface pressure-temperature state.
-    2. The climate model is solved for radiative-convective equilibrium (RCE)
-       using that surface composition.
-    3. Surface temperature is iterated until these two steps are mutually
-       consistent.
-    """
 
     def __init__(self, species_file, settings_file, flux_file, data_dir=None):
-        """Initialize the climate-equilibrium model.
+        """Initialize the climate-equilibrium wrapper.
 
         Parameters
         ----------
         species_file : str
-            Path to climate species YAML file.
+            Path to the climate species YAML file. The species entries include
+            elemental composition (unitless stoichiometric counts).
         settings_file : str
-            Path to climate settings YAML file.
+            Path to the climate settings YAML file.
         flux_file : str
-            Path to stellar flux file.
-        data_dir : str, optional
-            Optional path to photochem/clima data directory.
+            Path to the stellar flux file used by the climate model.
+        data_dir : str or None, optional
+            Optional path to a photochem/climate data directory.
+
+        Notes
+        -----
+        Pressures in this class are handled in cgs units (dyn/cm^2) unless
+        explicitly converted when calling equilibrium chemistry helpers.
         """
 
         super().__init__(
@@ -60,172 +55,165 @@ class AdiabatClimateEquilibrium(AdiabatClimate):
         # Save an equilibrium solver
         self.eqsolver = ChemEquiAnalysis(species_file)
 
-        # Do some extra work to get species masses (g/mol)
+        # Do some extra work to get composition
         with open(species_file,'r') as f:
             species_dict = yaml.load(f, Loader=yaml.Loader)
-        # Get atoms_masses
-        atoms_masses = {}
-        for val in species_dict['atoms']:
-            atoms_masses[val['name']] = val['mass']
-        # Get species masses (g/mol)
         self.species_composition = {}
         for sp in species_dict['species']:
-            mass = 0.0
-            for atom in sp['composition']:
-                mass += sp['composition'][atom]*atoms_masses[atom]
             self.species_composition[sp['name']] = sp['composition']
 
-    def equilibrate_columns(self, T_surf, N_i):
-        """Compute surface partial pressures from bulk columns at fixed ``T_surf``.
+    def compute_P_grid(self, P_surf):
+        """Construct the pressure grid used for equilibrium calculations.
 
         Parameters
         ----------
-        T_surf : float
-            Trial surface temperature in K.
-        N_i : dict
-            Mapping from species name to column inventory (mol/cm^2).
+        P_surf : float
+            Surface pressure in dyn/cm^2.
 
         Returns
         -------
         ndarray
-            Surface partial pressures in dynes/cm^2 ordered as
-            ``self.species_names``.
-
-        Notes
-        -----
-        This routine (i) computes a consistent surface pressure from
-        :meth:`make_column`, (ii) derives elemental abundances from ``N_i``,
-        and (iii) solves thermochemical equilibrium at ``(P_surf, T_surf)``.
+            1D pressure grid in dyn/cm^2, including the surface level and
+            extending to ``self.P_top``.
         """
-        # T_surf is surface T in K
-        # N_i is dict of each atmospheric species reservoir in moles/cm^2
+        P_top =self.P_top
+        nz = len(self.T)
+        P_grid = np.logspace(np.log10(P_surf), np.log10(P_top), 2*nz+1)
+        P_grid = np.append(P_grid[0], P_grid[1::2])
+        return P_grid
 
-        # Convert to an array 
-        N_i_arr = np.ones(len(self.species_names))*1e-15
-        for sp,val in N_i.items():
-            ind = self.species_names.index(sp)
-            N_i_arr[ind] = val
-        N_i_arr = np.clip(N_i_arr, a_min=0.0, a_max=np.inf)
-
-        # Use AdiabatClimate's own column solver to get the physically consistent
-        # surface pressure for the current species set and T_surf.
-        T_trop_prev = self.T_trop
-        self.T_trop = T_surf - T_surf*1e-5
-        try:
-            self.make_column(T_surf, N_i_arr)
-        finally:
-            self.T_trop = T_trop_prev
-        P_surf = self.P_surf # dynes/cm^2
-
-        # Compute atomic composition
-        atoms_res = np.ones(len(self.eqsolver.atoms_names))*1e-10
-        for i,sp in enumerate(self.species_names):
-            if N_i_arr[i] <= 0.0:
-                continue
-            if sp not in self.species_composition:
-                continue
-            for atom,stoich in self.species_composition[sp].items():
-                if atom in self.eqsolver.atoms_names:
-                    j = self.eqsolver.atoms_names.index(atom)
-                    atoms_res[j] += N_i_arr[i]*stoich
-
-        # Set atomic composition
-        if np.sum(atoms_res) <= 0.0:
-            raise ValueError('N_i does not contain atoms used by the equilibrium solver.')
-        molfracs_atoms_sun = np.ones_like(self.eqsolver.molfracs_atoms_sun)*1e-10
-        for i,atom in enumerate(self.eqsolver.atoms_names):
-            molfracs_atoms_sun[i] = atoms_res[i] # atomic composition
-        molfracs_atoms_sun /= np.sum(molfracs_atoms_sun) 
-        self.eqsolver.molfracs_atoms_sun = molfracs_atoms_sun
-
-        # Solve for equilibrium
-        converged = self.eqsolver.solve_metallicity(P_surf, T_surf, metallicity=1.0)
-
-        # Get mixing ratios
-        f_i_surf = np.zeros(len(self.species_names))
-        for j,sp in enumerate(self.eqsolver.gas_names):
-            ind = self.species_names.index(sp)
-            f_i_surf[ind] = self.eqsolver.molfracs_species_gas[j]
-        f_i_surf = f_i_surf/np.sum(f_i_surf)
-
-        # Partial pressures
-        P_i_surf = f_i_surf*P_surf
-
-        if not converged:
-            P_i_surf *= np.nan
-
-        return P_i_surf
-
-    def RCE_robust(self, P_i, T_guess_mid=None, T_perturbs=None):
-        """Attempt an RCE solve using a sequence of robust temperature guesses.
+    def RCE_robust(self, P_i, T_init, custom_dry_mix):
+        """Run radiative-convective equilibrium with fallback temperature guesses.
 
         Parameters
         ----------
         P_i : ndarray
-            Surface partial pressures (dynes/cm^2), ordered as
-            ``self.species_names``.
-        T_guess_mid : float, optional
-            Central value for surface-temperature perturbation guesses. If
-            ``None``, uses ``1.5 * self.rad.equilibrium_temperature(0.0)``.
-        T_perturbs : ndarray, optional
-            Additive perturbations (K) applied to ``T_guess_mid``.
+            Surface partial pressures for model species in dyn/cm^2. Ordering
+            must match ``self.species_names``.
+        T_init : ndarray
+            Initial temperature state in K. Expected shape is ``(nz + 1,)``
+            with ``T_init[0]`` as surface temperature and the remainder as
+            atmospheric layer temperatures.
+        custom_dry_mix : dict
+            Dry composition profiles passed through to ``self.RCE``. Must
+            include key ``'pressure'`` in dyn/cm^2 and per-species mixing-ratio
+            profiles (unitless mole fractions).
 
         Returns
         -------
         bool
-            ``True`` if any attempted RCE solve converges, else ``False``.
+            ``True`` if an RCE solution converged, otherwise ``False``.
         """
 
-        if T_guess_mid is None:
-            T_guess_mid = self.rad.equilibrium_temperature(0.0)*1.5
-        
-        if T_perturbs is None:
-            T_perturbs = np.array([0.0, 50.0, -50.0, 100.0, -100.0, 150.0, 800.0, 600.0, 400.0, 300.0, 200.0])
+        T_surf_guess = T_init[0]
+        T_guess = T_init[1:]
+        try:
+            converged = self.RCE(P_i, T_surf_guess, T_guess, custom_dry_mix=custom_dry_mix)
+        except ClimaException:
+            converged = False
 
-        # Try a bunch of isothermal atmospheres.
+        if converged:
+            return True
+
+        T_guess_mid = self.rad.equilibrium_temperature(0.0)*1.5
+        T_perturbs = np.array([0.0, 50.0, -50.0, 100.0, -100.0, 150.0, 800.0, 600.0, 400.0, 300.0, 200.0])
+
         for i,T_perturb in enumerate(T_perturbs):
             T_surf_guess = T_guess_mid + T_perturb
             T_guess = np.ones(self.T.shape[0])*T_surf_guess
             try:
-                converged = self.RCE(P_i, T_surf_guess, T_guess)
+                converged = self.RCE(P_i, T_surf_guess, T_guess, custom_dry_mix=custom_dry_mix)
                 if converged:
                     break
             except ClimaException:
                 converged = False
 
         return converged
-
-    def _g(self, T_surf, N_i):
-        """Evaluate the fixed-point map for the coupled climate-chemistry solve.
+    
+    def get_molfracs_atoms(self, mix):
+        """Convert species mole fractions into elemental mole fractions.
 
         Parameters
         ----------
-        T_surf : float
-            Trial surface temperature in K.
-        N_i : dict
-            Mapping from species name to column inventory (mol/cm^2).
+        mix : dict
+            Mapping from species name to species mole fraction (unitless) at
+            the reference level used to define elemental abundances.
 
         Returns
         -------
-        float
-            Updated surface temperature from the climate model when RCE
-            converges; ``np.nan`` otherwise.
+        ndarray
+            Elemental mole fractions (unitless), ordered as
+            ``self.eqsolver.atoms_names`` and normalized to sum to 1.
         """
-        P_i = self.equilibrate_columns(T_surf, N_i)
-        converged = self.RCE_robust(P_i)
-        if not converged:
-            return np.nan
-        return self.T_surf
-    
-    def solve(self, N_i, *, tol=1.0, **kwargs):
-        """Solve for a self-consistent surface temperature.
+
+        molfracs_atoms_sun = np.ones(len(self.eqsolver.atoms_names))*1e-10
+        for sp in mix:
+            for i,atom in enumerate(self.eqsolver.atoms_names):
+                if atom in self.species_composition[sp]:
+                    molfracs_atoms_sun[i] += self.species_composition[sp][atom]*mix[sp]
+        molfracs_atoms_sun /= np.sum(molfracs_atoms_sun)
+
+        return molfracs_atoms_sun
+
+    def g_eval(self, T, P_surf, mix):
+        """Evaluate the fixed-point map for climate-chemistry coupling.
 
         Parameters
         ----------
-        N_i : dict
-            Mapping from species name to column inventory (mol/cm^2).
+        T : ndarray
+            Temperature state in K for the full column, shape ``(nz + 1,)``.
+            Entry 0 is surface temperature; remaining entries are atmospheric
+            temperatures.
+        P_surf : float
+            Surface pressure in dyn/cm^2.
+        mix : dict
+            Species mole fractions (unitless) used to compute elemental
+            abundances for equilibrium chemistry.
+
+        Returns
+        -------
+        ndarray
+            Updated temperature state in K with shape ``(nz + 1,)``. Returns
+            ``NaN`` values if the internal climate solve does not converge.
+        """
+
+        eqsolver = self.eqsolver
+
+        # Compute the P grid
+        P_grid = self.compute_P_grid(P_surf)
+
+        # Compute chemical equilibrium
+        molfracs_atoms = self.get_molfracs_atoms(mix)
+        gases, condensates = equilibrate_atmosphere(eqsolver, P_grid/1e6, T, molfracs_atoms)
+        # Copy to climate model
+        P_i = np.ones(len(self.species_names))*1.0e-30
+        custom_dry_mix = {'pressure': P_grid}
+        for i,sp in enumerate(self.species_names):
+            custom_dry_mix[sp] = np.maximum(gases[sp],1.0e-30)
+            P_i[i] = np.maximum(gases[sp][0], 1.0e-30)*P_grid[0]
+        assert np.isclose(np.sum(P_i), P_grid[0])
+
+        # Solve climate
+        converged = self.RCE_robust(P_i, T, custom_dry_mix)
+        if not converged:
+            return np.zeros_like(T)*np.nan
+        
+        return np.append(self.T_surf, self.T)
+    
+    def solve(self, P_surf, mix, *, tol=1.0, max_tol=2.0, **kwargs):
+        """Solve the climate fixed-point problem for a given surface pressure.
+
+        Parameters
+        ----------
+        P_surf : float
+            Surface pressure in dyn/cm^2.
+        mix : dict
+            Species mole fractions (unitless). Values are normalized internally
+            before use.
         tol : float, optional
-            Residual tolerance for the fixed-point solver (K for scalar solve).
+            Convergence tolerance for the scaled RMS fixed-point residual in K.
+        max_tol : float, optional
+            Maximum allowed per-component scaled residual in K.
         **kwargs
             Additional keyword arguments forwarded to
             :class:`fixedpoint.RobustFixedPointSolver`.
@@ -233,16 +221,27 @@ class AdiabatClimateEquilibrium(AdiabatClimate):
         Returns
         -------
         SolveResult
-            Output object from :class:`fixedpoint.RobustFixedPointSolver`.
+            Result object returned by
+            :class:`fixedpoint.RobustFixedPointSolver.solve`.
         """
 
-        def g(x):
-            return np.array([self._g(x[0], N_i)])
+        # Normalize
+        mix_ = deepcopy(mix)
+        f_tot = 0.0
+        for sp in mix_:
+            f_tot += mix_[sp]
+        for sp in mix:
+            mix_[sp] /= f_tot
 
+        def g(x):
+            return self.g_eval(x, P_surf, mix_)
+
+        x0 = np.ones(len(self.T)+1)*self.rad.equilibrium_temperature(0.0)*1.5
         solver = RobustFixedPointSolver(
             g=g,
-            x0=np.array([self.rad.equilibrium_temperature(0.0)*1.5]),
+            x0=x0,
             tol=tol,
+            max_tol=max_tol,
             **kwargs
         )
         result = solver.solve()
@@ -250,16 +249,18 @@ class AdiabatClimateEquilibrium(AdiabatClimate):
         return result
     
     def return_atmosphere(self):
-        """Return the current climate state in array/dict form.
+        """Return the current climate state.
+
+        Parameters
+        ----------
+        None
 
         Returns
         -------
         tuple
-            ``(P, T, mix)`` where:
-
-            - ``P`` is pressure in dynes/cm^2 including the surface point.
-            - ``T`` is temperature in K including the surface point.
-            - ``mix`` is a dict mapping species name to mixing-ratio profile.
+            ``(P, T, mix)`` where ``P`` is pressure in dyn/cm^2 (surface
+            included), ``T`` is temperature in K (surface included), and
+            ``mix`` maps species names to unitless mixing-ratio profiles.
         """
         f_i = np.concatenate((self.f_i_surf.reshape((1,len(self.f_i_surf))),self.f_i))
         P = np.append(self.P_surf, self.P)
@@ -270,6 +271,47 @@ class AdiabatClimateEquilibrium(AdiabatClimate):
             mix[sp] = f_i[:,i]
 
         return P, T, mix
+
+def equilibrate_atmosphere(eqsolver, P, T, molfracs_atoms):
+
+    # Check inputs
+    if not isinstance(P, np.ndarray):
+        raise ValueError('`P` should be a numpy array.')
+    if not isinstance(T, np.ndarray):
+        raise ValueError('`T` should be a numpy array.')
+
+    # Some conversions and copies
+    P_cgs = P*1e6
+    gas_names = eqsolver.gas_names
+    condensate_names = eqsolver.condensate_names
+
+    gases = {}
+    for key in gas_names:
+        gases[key] = np.empty(len(P))
+    condensates = {}
+    for key in condensate_names:
+        condensates[key] = np.empty(len(P))
+
+    for i in range(len(P)):
+        if i > 0:
+            eqsolver.use_prev_guess = True
+        # Try many perturbations on T to try to get convergence
+        for eps in [0.0, 1.0e-12, -1.0e-12, 1.0e-8, -1.0e-8, 1.0e-6, -1.0e-6, 1.0e-4, -1.0e-4]:
+            converged = eqsolver.solve(P_cgs[i], T[i] + T[i]*eps, molfracs_atoms=molfracs_atoms)
+            if converged:
+                break
+        if not converged:
+            # We will not enforce convergence.
+            pass
+        molfracs_species_gas = eqsolver.molfracs_species_gas
+        molfracs_species_condensate = eqsolver.molfracs_species_condensate
+        for j,key in enumerate(gas_names):
+            gases[key][i] = molfracs_species_gas[j]
+        for j,key in enumerate(condensate_names):
+            condensates[key][i] = molfracs_species_condensate[j]
+    eqsolver.use_prev_guess = False
+
+    return gases, condensates
 
 ### Modified version of Photochemical model ###
 
