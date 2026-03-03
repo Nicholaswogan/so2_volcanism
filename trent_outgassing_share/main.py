@@ -1,18 +1,28 @@
 from matplotlib import pyplot as plt
 import numpy as np
 from threadpoolctl import threadpool_limits
+_ = threadpool_limits(limits=1)
+
+import os
+THISFILE = os.path.dirname(os.path.abspath(__file__))
 
 from models import AdiabatClimateEquilibrium, EvoAtmosphereRobust
 
-def plot(P, T, mix, ylim, filename, species):
+def plot(P, T, mix, ylim, filename, P_ref=1e3):
     plt.rcParams.update({'font.size': 13})
     fig, ax = plt.subplots(1,1,figsize=[5,4])
 
-    for i,sp in enumerate(species):
-        ls = '-'
-        if i > 9:
-            ls = ':'
-        ax.plot(mix[sp], P/1e6, lw=2, label=species[i], ls=ls)
+    ind = np.argmin(np.abs(P - P_ref))
+    species_layer = []
+    mix_layer = np.empty(len(mix))
+    for i,sp in enumerate(mix):
+        species_layer.append(sp)
+        mix_layer[i] = mix[sp][ind]
+    inds = np.argsort(mix_layer)[::-1]
+    
+    for i in inds[:10]:
+        sp = species_layer[i]
+        ax.plot(mix[sp], P/1e6, lw=2, label=sp)
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlim(1e-10,1.2)
@@ -26,54 +36,38 @@ def plot(P, T, mix, ylim, filename, species):
 
     plt.savefig(filename, dpi=150, bbox_inches='tight')
 
-# def plot_history
+def run(P_surf, mix, verbose=False):
 
-def main():
-
-    # Columns of each gas in moles/cm^2
-    N_i = {
-        'CO2': 100.0,
-        'H2O': 1.0,
-        'SO2': 10.0,
-    }
-
-    # Initialize
-    c = AdiabatClimateEquilibrium(
-        species_file='input/species_climate.yaml',
-        settings_file='input/settings_climate.yaml',
-        flux_file='input/gj176_scaled_to_l9859d.txt',
-        data_dir=None
-    )
-    c.verbose = True # enable all printing
+    c = CLIMATE_MODEL
 
     # Solve
-    solve_history = c.solve(N_i, verbose=True) # enable all printing
+    solve_history = c.solve(P_surf, mix, verbose=verbose) # enable all printing
 
-    # Plot end state
+    # Return P, T, mix
     P, T, mix = c.return_atmosphere()
-    species_plot = c.species_names
-    plot(P, T, mix, ylim=(c.P_surf/1e6,1e-7), filename='figures/PTX_climate.png', species=species_plot)
 
-    # Now run Photochemistry
-    pc = EvoAtmosphereRobust(
-        mechanism_file='input/zahnle_HOCS.yaml',
-        settings_file='input/settings.yaml',
-        flux_file='input/gj176_scaled_to_l9859d.txt'
-    )
-    pc.var.verbose = 1 # enable all printing
-    pc.rdat.verbose = True
+    return P, T, mix
 
-    # Initialize to climate state
-    Kzz = np.ones_like(P)*1e6
-    pc.initialize_to_PT(P, T, Kzz, mix)
+def example():
 
-    # Solve
-    pc.find_steady_state_robust()
+    P_surf = 1.0e6 # dynes/cm^2
+    # Some composition
+    mix = {
+        'CO2': 0.5,
+        'H2O': 0.2,
+        'SO2': 0.3,
+    }
+    P, T, mix = run(P_surf, mix, verbose=True)
 
-    # Plot
-    P1, T1, mix1 = pc.return_atmosphere()
-    plot(P1, T1, mix1, ylim=(c.P_surf/1e6,1e-7), filename='figures/PTX_photochem.png', species=species_plot)
+    plot(P, T, mix, ylim=(P[0]/1e6,P[-1]/1e6), filename='figures/test.pdf', P_ref=1e3)
+
+# Initialize global
+CLIMATE_MODEL = AdiabatClimateEquilibrium(
+    species_file=os.path.join(THISFILE, 'input/species_climate.yaml'),
+    settings_file=os.path.join(THISFILE, 'input/settings_climate.yaml'),
+    flux_file=os.path.join(THISFILE, 'input/gj176_scaled_to_l9859b.txt'),
+)
 
 if __name__ == "__main__":
     _ = threadpool_limits(limits=4) # set number of threads
-    main()
+    example()

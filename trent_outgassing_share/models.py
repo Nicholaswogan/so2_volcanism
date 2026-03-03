@@ -229,7 +229,14 @@ class AdiabatClimateEquilibrium(AdiabatClimate):
         mix_ = deepcopy(mix)
         f_tot = 0.0
         for sp in mix_:
-            f_tot += mix_[sp]
+            val = float(mix_[sp])
+            if not np.isfinite(val):
+                raise ValueError(f"mix[{sp!r}] must be finite; got {mix_[sp]!r}")
+            if val < 0.0:
+                raise ValueError(f"mix[{sp!r}] must be >= 0; got {mix_[sp]!r}")
+            f_tot += val
+        if f_tot <= 0.0:
+            raise ValueError("Sum of mix values must be > 0 for normalization.")
         for sp in mix:
             mix_[sp] /= f_tot
 
@@ -245,6 +252,20 @@ class AdiabatClimateEquilibrium(AdiabatClimate):
             **kwargs
         )
         result = solver.solve()
+
+        if not result.converged:
+            msg = (
+                "AdiabatClimateEquilibrium fixed-point solve failed to converge "
+                f"(iters={result.iters}, func_evals={result.func_evals})."
+            )
+            if result.history:
+                k, _, r_k, rnorm, omega_k, beta_k = result.history[-1]
+                rmax = float(np.max(np.abs(r_k)))
+                msg += (
+                    f" Last iter={k}, residual_rms={rnorm:.3e}, "
+                    f"residual_max_abs={rmax:.3e}, omega={omega_k:.3f}, beta={beta_k:.3f}."
+                )
+            raise RuntimeError(msg)
 
         return result
     
